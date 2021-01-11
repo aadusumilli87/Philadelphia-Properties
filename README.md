@@ -1,2 +1,2 @@
 # Philadelphia-Properties
-Using regression techniques to predict home prices in Philadelphia from property assessment data. 
+Using regression techniques to predict home prices in Philadelphia from property assessment data. This was my first grad school project and is admittedly rather rough around the edges, however I decided to upload it for a few reasons. The foremost reason is that it contains some of my best visualizations - heatmaps of Philadelphia made using the `sf` GIS package. Additionally, the extraordinarily messy nature of the municipal property assessments data will hopefully illustrate my abilities to clean and wrangle data, as well employ some creativity with feature engineering. 
