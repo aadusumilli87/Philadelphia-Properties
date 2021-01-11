@@ -1,0 +1,1209 @@
+---
+title: 'Predicting Property Values in Philadelphia'
+author: 'Amar Adusumilli'
+date: 2019-12-20
+output: html_document
+---
+```{r load.data, echo = FALSE, warning = FALSE, message = FALSE}
+start.time <- Sys.time()
+# Explore the Philadelphia Properties Dataset
+# Predict home values with regression techniques
+# Load packages
+library(data.table) # Fast data manipulation
+library(tidyverse) # plotting, functional programming, factor and date functions
+library(caret) # modeling 
+library(sf) # GIS tools
+# 1 - Data Cleaning --------------------------------------------------------------------------------
+# Load 
+# Properties contains the housing data, crime contains the crime data, District contains school catchment
+properties_SF.Trim <- fread('opa_properties_23.10.19.csv', verbose = FALSE)
+crime_dt <- fread('arrest_data_daily_by_district_csv.csv', verbose = FALSE)
+school_dt <- fread('School.Data.Trimmed.csv', verbose = FALSE)
+
+
+# Focusing on Properties first
+# Filter the data
+properties_SF.Trim <- properties_SF.Trim[category_code_description == 'Single Family']
+
+# Will attempt to see if there is any visible trend between a given variable and market value (the response variable)
+# Fist will see the class of the variables
+variable_class <- properties_SF.Trim[, lapply(.SD, class)]
+variable_class <- variable_class %>% 
+  gather(key = 'Variable', value = 'Class')
+
+# Most columns are characters. Many categorical data columns are listed as integers, not factors
+# For a description on why an individual variable was removed, see project notes
+# This is a first pass - may remove more later as I get further in the analysis
+Delete_Cols <- variable_class$Variable[c(2, 3, 4, 10, 11, 12, 14, 15, 18, 19, 22, 
+                                         24, 25, 26, 29, 30, 31, 32, 33, 34, 
+                                         36, 41, 42, 44, 46, 47, 48, 49, 50, 51, 52,
+                                         53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 
+                                         66, 67, 68, 69)] 
+# Remove The Columns
+properties_SF.Trim <- properties_SF.Trim[, !..Delete_Cols]
+
+# Crimes Data
+# classify crimes and aggregate by police district. 
+# Using FBI's UCR Standard 
+crime_dt[, Type1.Crimes := Homicide + Rape + `Robbery/Gun` + `Robbery/Other` + 
+           `Aggravated Assault/Gun` + `Aggravated Assault/Other` + `Burglary/Residential` +
+           `Burglary/Commercial` + `Theft of Motor Vehicle Tag` + `Theft from Person` +
+           `Theft from Auto` + `Retail Theft` + Theft + `Auto Theft`][, 
+            Type2.Crimes := `Drug Possession` + `Drug Sales` + DUI + `All Other Offenses`][, 
+            'date_formatted' := as.Date(date_value, 
+            format = '%m/%d/%Y')][, 'Year.Formatted' := lubridate::year(date_formatted)]
+
+# Load the PPD Shapefile
+# Will use this to assign properties to their Police District
+PPD.Districts <- read_sf('PPD.Boundaries')
+PPD.Districts <- st_as_sf(PPD.Districts)
+PPD.Districts <- st_transform(PPD.Districts, crs = 4326)
+
+# Two districts have since been merged - accounting for that here
+crime_dt <- crime_dt[, dc_district := as_factor(dc_district)][, 
+           dc_district := fct_collapse(dc_district, `3` = '4', `22` = '23')][
+           !(dc_district %in% c(71))]
+
+# Aggregate and Summarise by Year and District
+crimeSummary <- crime_dt[, .(Total.Crimes = sum(Type1.Crimes, Type2.Crimes),
+                Total.Type1 = sum(Type1.Crimes), Total.Type2 = sum(Type2.Crimes)), 
+                by = .(Year.Formatted, dc_district)]
+
+# Compute Rates
+crimeSummary.Melt <- crimeSummary %>% 
+  pivot_wider(names_from = Year.Formatted, values_from = c(Total.Crimes, Total.Type1, Total.Type2))
+crimeSummary.Melt <- setDT(crimeSummary.Melt)
+crimeDailyRates <- crimeSummary.Melt[, .(Police.District = dc_district, 
+                                         `2014Type1.Rate` = Total.Type1_2014 / 365, 
+                                         `2015Type1.Rate` = Total.Type1_2015 / 365,
+                                         `2016Type1.Rate` = Total.Type1_2016 / 366,
+                                         `2017Type1.Rate` = Total.Type1_2017 / 365,
+                                         `2018Type1.Rate` = Total.Type1_2018 / 365,
+                                         `2019Type1.Rate` = Total.Type1_2019 / 296,
+                                         `2014Type2.Rate` = Total.Type2_2014 / 365,
+                                         `2015Type2.Rate` = Total.Type2_2015 / 365,
+                                         `2016Type2.Rate` = Total.Type2_2016 / 366,
+                                         `2017Type2.Rate` = Total.Type2_2017 / 365,
+                                         `2018Type2.Rate` = Total.Type2_2018 / 365,
+                                         `2019Type2.Rate` = Total.Type2_2019 / 296)
+                                     ][, c('Type1.WeightedAvg', 'Type2.WeightedAvg') :=
+                                         .(0.05 * `2014Type1.Rate` + 0.1 * `2015Type1.Rate` +
+                                           0.15 * `2016Type1.Rate` + 0.2 * `2017Type1.Rate` + 
+                                           0.225 * `2018Type1.Rate` + 0.275 * `2019Type1.Rate`, 
+                                           0.05 * `2014Type2.Rate` + 0.1 * `2015Type2.Rate` +
+                                           0.15 * `2016Type2.Rate` + 0.2 * `2017Type2.Rate` + 
+                                           0.225 * `2018Type2.Rate` + 0.275 * `2019Type2.Rate`
+                                           )
+                                     ]
+
+# Reduce to just the variables going into the properties dataset
+crimeDailyRates <- crimeDailyRates[, .(Police.District, Type1.WeightedAvg, Type2.WeightedAvg)]
+
+# School Data
+ES.Catchment.Area <- read_sf('Catchment_ES_2017-18')
+
+# ST_as_SF ensures that the Catchment is an SF object
+# Will enable merging later
+ES.Catchment.Area <- st_as_sf(ES.Catchment.Area, crs = 4326)
+ES.Catchment.Area <- st_transform(ES.Catchment.Area, crs = 4326)
+
+# Trim the School Performance Data
+# This includes more than just public schools, but all that's needed are the performance metrics
+school_dt <- school_dt[, c(3, 22)]
+
+
+# 2 - EDA ----------------------------------------------------------------------------------------
+# Distribution of Market Values is Strongly Skewed to the Right
+# Taking the log may normalize the data - will add that and compare the distribution
+properties_SF.Trim[, Log.MktVal := log(market_value)]
+
+
+# Taking the log resulted in some -Inf's. Inspection revealed that these observations had market values of 0
+# Will isolate them here
+Zero.MktVal <- properties_SF.Trim[Log.MktVal == -Inf]
+
+# There are 69 properties here with market values of 0
+# Will remove these
+properties_SF.Trim <- properties_SF.Trim[!is.infinite(properties_SF.Trim$Log.MktVal)]
+
+
+# Adding a variable for Percentile rank will help with EDA
+properties_SF.Trim[, 
+  c('Percentile.Rank', 
+    'Log.Percentile.Rank') := .(ntile(market_value, n = 100), ntile(Log.MktVal, n = 100))]
+
+# Removing market value outliers - these were clearly mistakes
+properties_SF.Trim <- properties_SF.Trim[market_value < 100000000][
+  !is.na(market_value)
+]
+
+# Will look at the other variables now
+Numeric.Quantiles <- sapply(select_if(properties_SF.Trim, is.numeric), 
+  quantile, probs = seq(0, 1, 0.02), na.rm = TRUE)
+
+
+# Number of rooms 
+# Almost none of these align with the number of bathrooms + number of bedrooms
+# Unclear how a 'room' is defined here
+properties_SF.Trim[, number_of_rooms := NULL]
+
+# Now depth
+# Will remove this variable 
+properties_SF.Trim[, depth := NULL]
+
+# Garage Spaces
+# This variable misrepresents garage spaces for condo's
+# Will list a condo as having 30 spaces, as though it were a 30 car garage
+properties_SF.Trim[, garage_spaces := NULL]
+properties_SF.Trim[, garage_type := NULL]
+
+# Number of Bathrooms and Bedrooms
+# Both have 100K observations with 0 bedrooms or bathrooms
+properties_SF.Trim <- properties_SF.Trim[!(location %in% c('900 S 12TH ST', '812 S 13TH ST'))]
+properties_SF.Trim[, c('number_of_bathrooms', 'number_of_bedrooms') := NULL]
+
+# Number of Stories
+# 100K observations with 0 stories
+properties_SF.Trim[, number_stories := NULL]
+
+# Basements
+# 1/3rd missing values, will remove
+properties_SF.Trim[, basements := NULL]
+
+# Total Area
+# Some properties that have a listed area of zero
+# Isolating on those reveals that many observations have total area of zero but non zero total livable area
+# Will remove total area
+properties_SF.Trim[, total_area := NULL]
+
+# Total Livable Area
+# 526 observations that show as having an area of zero
+# Will remove these
+# Some properties with very high total livable areas are not single family homes
+# Many are housing for religious societies (Convents)
+# Others are clearly mistakes
+properties_SF.Trim <- properties_SF.Trim[total_livable_area > 0]
+properties_SF.Trim <- properties_SF.Trim[
+  !owner_1 %in% c('REV DENNIS J DOUGHERTY', 'DOUGHERTY DENNIS J', 'PHILADELPHIA UNIVERSITY', 
+                  'DENNIS J DOUGHERTY	', 'TALMUDICAL YESHIVA OF PHI', "SAINT JOSEPH'S UNIVERSITY",
+                  'SAINT JOSEPHS UNIVERSITY', 'CHURCH CHRISTIAN COMPASSI', 'CHRIST EMPOWERMENT TEMPLE',
+                  'ST JAMES CATHOLIC', 'CARMELITE CONVENT OF', '	1439-61 NORTH 31ST STREET', 
+                  'UNITY MISSION CHURCH', 'KWAN UM SA BUDDHIST', 'SECOND BAPTIST CHURCH',
+                  'UNITED COMMUNITIES', 'SOMERSET LLC', 'INTERCOMMUNITY ACTION INC', 
+                  'REV DENNIS DOUGHERTY', 'INDONESIA BETHEL CHURCH B', 'DARE TO IMAGINE CHURCH IN',
+                  'FRIENDS BEHAVORIAL HEALTH', 'CHOICE ACADEMICS INC', 'FRIENDS REHABILITATION PR',
+                  'ARCHBISHOP OF PHILADELPHI', 'HOLMESBURG BAPTIST CHURCH', 'DOMINICAN FATHERS & BROTH',
+                  'TALMUDICAL YESHIVA OF PHI', 'JAMESON EVANGELISTIC', '1439-61 NORTH 31ST STREET')]
+                  
+
+# Removing Philadelphia Housing Authority, Redevelopment Authority, and Land Bank houses
+properties_SF.Trim <- properties_SF.Trim[!(owner_1 %in% 
+                                       c('PHILADELPHIA HOUSING AUTH', 'PHILA HOUSING AUTHORITY', 
+                                       'PHILADELPHIA LAND BANK', 'PHILADELPHIA HOUSING', 
+                                       'PHILADELPHIA REDEVELOPMEN', 'PHILA REDEVELOPMENT AUTH',
+                                       'PHILA HOUSING AUTH', 'PHILA REDEVELOPMENT'))]
+
+# Removing Condo Parking Spaces and Residential Air Rights
+properties_SF.Trim <- properties_SF.Trim[
+  !(building_code_description) %in% c('CONDO PARKING SPACE', 'AIR RIGHTS RESIDENTIAL')]
+
+# Removing NA's and 0's in Exterior and Interior Condition
+properties_SF.Trim <- properties_SF.Trim[
+  !is.na(exterior_condition)][
+  !is.na(interior_condition)][!(interior_condition %in% 0)][
+  !(exterior_condition %in% 0)]
+
+# Removing Observations with Year Built of '0'
+properties_SF.Trim <- properties_SF.Trim[!(year_built) %in% c('0')]
+
+# Removing Observations with Missing Lat/Long
+properties_SF.Trim <- properties_SF.Trim[!is.na(lng)]
+
+# Most of the remaining non ID variables will go in the model
+
+# 3 - Transformation ----------------------------------------------------------------------------
+# Recode Categorical Vars as factors/numeric where applicable
+# Exterior Condition
+properties_SF.Trim[, exterior_condition := as_factor(exterior_condition)]
+properties_SF.Trim[, exterior_condition := fct_recode(exterior_condition, 
+                                     '7' = '1', '6' = '2', '5' = '3',
+                                     '4' = '4', '3' = '5', 
+                                     '2' = '6', '1' = '7')]
+properties_SF.Trim[,
+    exterior_condition := as.numeric(as.character(properties_SF.Trim$exterior_condition))]
+
+# Interior Condition
+properties_SF.Trim[, interior_condition := as_factor(interior_condition)][
+  , interior_condition := fct_recode(interior_condition,
+                                     '7' = '1', '6' = '2', '5' = '3',
+                                     '4' = '4', '3' = '5', 
+                                     '2' = '6', '1' = '7')]
+properties_SF.Trim[,
+    interior_condition := as.numeric(as.character(properties_SF.Trim$interior_condition))]
+
+# View Type
+properties_SF.Trim[, c('view_type') := 
+                     lapply(.SD, as_factor), .SDcols = c('view_type')]
+
+# Add the distance variable - Using City Hall as a proxy for 'downtown' distance
+Properties.Long.Lat <- properties_SF.Trim[, .(objectid, lng, lat)]
+# Compute Distance
+properties_SF.Trim[, 
+  City.Hall.Distance := geosphere::distHaversine(Properties.Long.Lat[, c(2:3)], 
+                                                 c(-75.1635112, 39.952335), r = 3963.1905919)]
+
+# To add in Police District and School Catchment, I will create an SF object with the Long.Lat DT above
+Properties.Long.Lat <- st_as_sf(Properties.Long.Lat, coords = c('lng', 'lat'), crs = 4326)
+
+# Apply Point in Polygon Algorithm to See which Police District each address belongs to
+PD.Intersection <- st_intersection(Properties.Long.Lat, PPD.Districts)
+st_geometry(PD.Intersection) <- NULL
+PD.Intersection <- PD.Intersection[, c(1, 5)]
+
+# Merge
+properties_SF.Trim <- merge(properties_SF.Trim, PD.Intersection, by = 'objectid')
+
+# Rename and set as factor
+setnames(properties_SF.Trim, old = 'DISTRICT_', new = 'Police.District')
+properties_SF.Trim[, Police.District := as_factor(Police.District)]
+
+# Add in the Crime Data
+properties_SF.Trim <- merge(properties_SF.Trim, crimeDailyRates, by = 'Police.District')
+
+# Repeating For Elementary Schools
+ES.Intersection <- st_intersection(Properties.Long.Lat, ES.Catchment.Area)
+st_geometry(ES.Intersection) <- NULL
+ES.Intersection <- ES.Intersection[, c(1, 2, 4)]
+
+# Merge with Intersection DT
+properties_SF.Trim <- merge(properties_SF.Trim, ES.Intersection, by = 'objectid')
+
+# Merge with Performance Data
+# Repeating the ULCS code to make merging easier
+colnames(school_dt) <- c('ES_ID', 'School.Score')
+school_dt[, ES_ID := as.character(school_dt$ES_ID)]
+properties_SF.Trim <- merge(properties_SF.Trim, school_dt, by = 'ES_ID')
+properties_SF.Trim[, School.Score := as.numeric(properties_SF.Trim$School.Score)]
+
+
+# 4 - Model -------------------------------------------------------------------------------
+# Running Descriptive Stats
+# Measures of Centrality
+MktVal.Centrality.Final <- data.table(
+  Mean = mean(properties_SF.Trim$market_value, na.rm = TRUE),
+  `Trimmed Mean 5%` = mean(properties_SF.Trim$market_value, na.rm = TRUE, trim = 0.05),
+  `Trimmed Mean 10%` = mean(properties_SF.Trim$market_value, na.rm = TRUE, trim = 0.1),
+  Median = median(properties_SF.Trim$market_value, na.rm = TRUE)
+)
+Log.MktVal.Centrality.Final <- data.table(
+  Mean = mean(properties_SF.Trim$Log.MktVal, na.rm = TRUE),
+  `Trimmed Mean 5%` = mean(properties_SF.Trim$Log.MktVal, na.rm = TRUE, trim = 0.05),
+  `Trimmed Mean 10%` = mean(properties_SF.Trim$Log.MktVal, na.rm = TRUE, trim = 0.1),
+  Median = median(properties_SF.Trim$Log.MktVal, na.rm = TRUE)
+)
+# Exponentiate back the log tranformed centrality measures
+Exp.Centrality.Final <- map_df(Log.MktVal.Centrality.Final, exp)
+
+# Combine Results
+Centrality.DT.Final <- bind_rows(
+  MktVal.Centrality.Final,
+  Log.MktVal.Centrality.Final,
+  Exp.Centrality.Final
+) %>% 
+  map_df(~round(., 2)) %>% 
+  mutate(Distribution = c('Market Values', 'Log Transformed Market Values', 'Exponentiated Log Values')) %>% 
+  select(5, 1:4)
+
+# Measures of variability
+MktVal.Variability.Final <- data.table(
+  `Standard Deviation` = sd(properties_SF.Trim$market_value, na.rm = TRUE),
+  `Median Absolute Deviation` = mad(properties_SF.Trim$market_value, na.rm = TRUE),
+  `Interquartile Range` = IQR(properties_SF.Trim$market_value, na.rm = TRUE),
+  Range = range(properties_SF.Trim$market_value, na.rm = TRUE)[2] - range(properties_SF.Trim$market_value, na.rm = TRUE)[1]
+) %>% map_df(~round(., 2))
+
+# Split Data into Test and Train
+properties.Model <- properties_SF.Trim[
+  , .(objectid, exterior_condition, interior_condition, total_livable_area, year_built, view_type,
+      Log.MktVal, City.Hall.Distance, Type1.WeightedAvg, Type2.WeightedAvg, ES_Short, School.Score)][
+  , total_livable_area := log(total_livable_area)
+      ]
+
+in.train <- createDataPartition(properties.Model$year_built, p = 0.8, list = FALSE, times = 1)
+
+properties.Train <- properties.Model[in.train]
+properties.Test <- properties.Model[-in.train]
+
+# Extracting the original market values and object ID's to merge back and calculate residuals
+Market.Value.DT <- properties_SF.Trim[, .(objectid, market_value)]
+
+# Test correlations
+Numeric.Correlation <- data.frame(Correlation = sapply(select_if(properties.Model, is.numeric), 
+       cor, y = properties.Model$Log.MktVal, use = 'complete.obs'))
+
+# Linear Model
+set.seed(11202019)
+LM.Params <- trainControl(method = "boot", number = 30)
+Linear.Model <- train(
+  x = properties.Train[, c(2, 3, 4, 6, 8, 9, 10, 11, 12)],
+  y = properties.Train$Log.MktVal,
+  method = 'lm',
+  trControl = LM.Params
+)
+
+# Add in Residuals
+properties.Train <- properties.Train %>% 
+  modelr::add_predictions(Linear.Model, var = 'Log.LM.Predictions') %>% 
+  left_join(y = Market.Value.DT, by = 'objectid') %>% 
+  mutate(Scaled.LM.Predictions = exp(Log.LM.Predictions),
+         LM.Residuals = market_value - Scaled.LM.Predictions)
+
+
+# Random Forest
+RF.Model <- ranger::ranger(Log.MktVal ~ total_livable_area + exterior_condition + interior_condition + City.Hall.Distance + Type1.WeightedAvg + Type2.WeightedAvg + School.Score,
+                           data = properties.Train,
+                           num.trees = 500, mtry = 4, verbose = FALSE, importance = 'impurity')
+
+
+# Add predictions and residuals
+setDT(properties.Train)
+properties.Train[, c('Log.RF.Predictions') := 
+                   RF.Model$predictions,][,
+  c('Scaled.RF.Predictions') := 
+      .(exp(Log.RF.Predictions))][,
+  RF.Residuals := market_value - Scaled.RF.Predictions
+  ]
+
+
+# Consolidate Training Results in a Table for Presentation
+Training.Preds <- data.table(
+  objectid = properties.Train$objectid,
+  Scaled.LM.Predictions = properties.Train$Scaled.LM.Predictions,
+  Sclaed.RF.Predictions = properties.Train$Scaled.RF.Predictions
+)
+
+
+Training.Preds <- merge(Training.Preds, Market.Value.DT, by = 'objectid')
+
+Training.Accuracy <- data.frame(
+  RMSE = map_dbl(Training.Preds[, c(2:3)], ~ RMSE(., Training.Preds$market_value)),
+  MAE = map_dbl(Training.Preds[, c(2:3)], ~ MAE(., Training.Preds$market_value))
+) %>% 
+  map_dfc(~round(.)) %>% 
+  mutate(
+    Model = c('Linear Model', 'Random Forest')
+  ) %>% 
+  select(3, 1, 2)
+
+
+# Consolidate and calculate residuals for Test Accuracy
+# Add in Market Value Test DT
+# Test Predictions
+properties.Test <- merge(properties.Test, Market.Value.DT, by = 'objectid')
+properties.Test[,
+ ':=' ('Log.LM.Predictions' = predict(Linear.Model, properties.Test), 
+      'Log.RF.Predictions' = predict(RF.Model, data = properties.Test)$predictions)][, 
+      c('Scaled.LM.Predictions', 'Scaled.RF.Predictions') 
+      := lapply(.SD, exp), 
+      .SDcols = c('Log.LM.Predictions', 'Log.RF.Predictions')][, 
+      c('LM.Resid', 'RF.Resid') := market_value - .SD, 
+    .SDcols = c('Scaled.LM.Predictions', 'Scaled.RF.Predictions')]
+
+
+# Calculate Accuracy
+Test.Accuracy <- data.frame(
+  RMSE = map_dbl(properties.Test[, c(16, 17)], ~ RMSE(., properties.Test$market_value)),
+  MAE = map_dbl(properties.Test[, c(16, 17)], ~ MAE(., properties.Test$market_value))
+) %>% 
+  map_dfc(~round(.)) %>% 
+  mutate(Model = c(
+    'Linear Model', 'Random Forest')) %>% 
+  select(3, 1:2)
+
+
+end.time <- Sys.time()
+
+time.elapsed <- end.time - start.time
+```
+
+### Introduction
+
+Following decades of decline wrought by de-industrialization, population loss, and other factors, the city of Philadelphia has shown tangible signs of revival, evidence of which is reflected through quantitative data. The population of the city has increased in every year since 2006, and strong sales in the housing market indicate that this trend is likely to continue. The city's most recently reported unemployment rate was 5.2% - a level unseen since the winter of 2000 (Bureau of Labor Statistics, 2019). The jail population has decreased by 39.5% since July 2015, the product of significant reform in the criminal justice system (MacArthur Foundation, 2019). The public high school graduation rate sits approximately 12% higher than it did in 2009 (Pew, 2019). Many other figures can be cited as indicators of positive change. However, with the third highest income inequality among American cities (Bloomberg, 2018), progress and growth has not been disseminated equally. Population growth has been largely situated in the center of city (Center City) and adjoining neighborhoods, with other outlying areas showing little change or continued declines in some cases. Median household income is only higher than the national average in approximately 25% of the city. In a similarly sized area, median household income is less than half of that mark (Pew, 2019). This inequality is best visualized through geography. 
+
+```{r Market.Value.Map, echo = FALSE, warning = FALSE, fig.width=9, fig.height=8}
+properties.ES.Avg <- properties_SF.Trim[, .(Mean = mean(market_value)), by = ES_ID]
+# Merge
+ES.Catchment.Area.Plot <- ES.Catchment.Area %>% 
+  left_join(y = properties.ES.Avg, by = 'ES_ID')
+# Plot
+ES.MktVal <- ggplot(ES.Catchment.Area.Plot) +
+  geom_sf(aes(fill = Mean)) +
+  coord_sf(expand = TRUE) +
+  ggthemes::theme_map() +
+  viridis::scale_fill_viridis(name = 'Mean Market Value', 
+                              guide = guide_colorbar(
+                                direction = 'horizontal',
+                                barwidth = unit(85, units = 'mm'),
+                                title.position = 'top',
+                                title.hjust = 0.5
+                              ), labels = scales::comma, option = 'magma', direction = 1) +
+  theme(legend.position = 'bottom') +
+  labs(title = 'Figure 1: Property Values in Philadelphia',
+       subtitle = 'Average Market Value by Elementary School Catchment Area, 2019',
+       caption = 'Source: Philadelphia Office of Property Assesments')
+ES.MktVal
+
+```
+
+The geographic distribution of single family home values shows a great dichotomy between the areas proximate to Center City and those further north and west. Distributions of educational attainment, crime, median income, and life expectancy show comparable geographic variation. Similar trends can be seen in many other cities across the United States, with varying levels of severity. While the reasons for this variation are contextually dependent between cities, and indeed, between neighborhoods within cities, certain shared factors inform the inequality visible on the map above. As mentioned in the opening sentence of this paper, de-industrialization and population loss were major reasons for Philadelphia's decline, but they too were not distributed evenly across the city. The dark shaded areas on the map correspond to the places most severely afflicted by these events, neighborhoods concentrated within the North and West sections of Philadelphia. Note that this does not apply to the regions to the far Northwest and Northeast - these neighborhoods are more suburban in character, with different patterns of development compared to the rest of the city. A full analysis of the multi-faceted causes and ramifications of post-industrial decline is beyond the scope of this paper, but it is worth noting for the clear impact said decline continues to have on market values throughout the city. I surmise that there must be some basket of explanatory variables which account for the low market values present in North and West Philadelphia, and conversely, for the high values present in Center City. In this paper, I attempt to predict single family property values in Philadelphia utilizing regression analysis. Through this process, I aim to assess the importance of the explanatory variables and present considerations to potentially direct and improve further analysis.
+
+### Hypothesis 
+
+In linear regression, for any variable $j$ the null hypothesis is that the coefficient $\beta_j = 0$. The alternative hypothesis is that the coefficient $\beta_j  \ne 0$. In more succinct notation, we can say: $H_0: \beta_j = 0; \ H_a: \beta_j \ne 0$. To assess significance, we use t-statistics, calculated under the general form: \[t_j = \frac{\beta_j - 0}{SE_{\beta_j}}\]
+If the coefficient for variable $j$ is 0, we conclude that variable $j$ has no effect on the dependent variable. This is simple to see mathematically - if the coefficient of a term is 0, then the value of the term itself is 0, and by extension the term does not contribute to the final prediction of the model. The t-test assesses only one coefficient at a time. To assess the significance of multiple coefficients jointly, the F-test is used. The F-test for linear regression compares a model with no explanatory variables (intercept only) to the specified model. The hypotheses for this test are as follows: $H_0: \beta_1 = \beta_2 = ... = 0; \ H_a: \beta_i \ne 0$. In plain English, the null hypothesis for the F-test is that none of the explanatory variables help explain the dependent variable. The alternative hypothesis is that at least one of the explanatory variables helps to explain the dependent variable. 
+
+### Data
+
+The primary data used in this analysis was the property assessments data set, published annually by the Philadelphia Office of Property Assessment and publicly available on the Open Data Philly webpage. It contains the officially assessed market value of every property in the city, as well as detail on the size, condition, location, and other attributes of said properties. When filtered on single family homes, the data contains over 450,000 observations and 77 variables. The properties dataset represents the population and contains many idiosyncrasies typical of municipal data. By extension, feature selection and data cleaning were difficult endeavors. The majority of these 77 variables were removed during exploratory data analysis. Variables were either included or dropped based on a somewhat subjective assessment of quality. In general, if a given variable contained a significant proportion of missing values, or if it lacked a comprehensible description in the metadata, it was dropped. This resulted in dropping several variables that would otherwise appear to be relevant, including number of bathrooms and garage spaces. Other variables, such as the name of the property owner, or the order that licensing documents were received, were dropped due to clearly being extraneous to the purpose of predicting market values. Observations were dropped based on a similar criteria - all observations with missing market values were removed, as well as missing values within any of the four independent variables taken from the properties dataset. Additionally, all instances of public housing were removed, as they do not conform to the same market forces as other properties. Similarly, observations corresponding to 'residential air rights' and 'condo parking space' were removed. Other observations were dropped situationally through the examination of outliers - many were clear errors within data entry or data collection. In all, some 10,000 observations were dropped, leaving 453,367 data points in the final, cleaned dataset. 
+
+Additional data used in this analysis pertained to crime and elementary schools. The crime data consisted of daily arrests by police district, spanning back to 2014. This dataset is maintained by the Philadelphia District Attorney's Office and is updated regularly. Arrests are split out into 18 distinct bins, ranging from homicides to DUI's. The school data, published by the School District of Philadelphia, consisted of numerous progress scores given to the individual elementary schools on various criteria. The 'overall score', an aggregate of these varying ratings, was taken as the measure of school performance. The information contained within these two datasets was added to the properties data through the use of certain Geographic Information Systems (GIS) tools - the specifics are detailed in the 'method' section of this paper. 
+
+### Method
+
+The core intuition that guided the model building process was that the market value of any given property was a function of the descriptive attributes of the property itself, the characteristics of its surrounding location, and its proximity towards places of interest. Utilizing regression techniques, I attempted to codify this equation. Two models were used: a multiple linear regression model, and a random forest model. The distribution of market values was highly skewed, as seen below:
+
+```{r Mkt.Value Dist, echo = FALSE, warning = FALSE}
+Mkt.Val.Dist <- ggplot(properties_SF.Trim) +
+  geom_histogram(aes(market_value), binwidth = 2 * IQR(properties_SF.Trim$market_value, na.rm = TRUE) / length(properties_SF.Trim$market_value)^(1/3)) +
+  coord_cartesian(xlim = c(0, 1000000)) +
+  scale_x_continuous(breaks = seq(0, 1000000, by = 100000), labels = scales::comma) +
+  labs(x = 'Property Value', y = 'Count', title = 'Figure 2: Distribution of Home Values in Philadelphia', subtitle = 'Single Family Homes Only',
+       caption = 'Source: Philadelphia Office of Property Assessment') +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 50, hjust = 1))
+Mkt.Val.Dist
+```
+
+Due to this skew, a log transformation was used on the distribution of market values. The distribution of the log-transformed market values is far more symmetric, as seen below:
+
+```{r LogMkt.Value Dist, echo = FALSE, warning = FALSE}
+Log.Dist <- ggplot(properties_SF.Trim) +
+  geom_histogram(aes(Log.MktVal), binwidth = 2 * IQR(properties_SF.Trim$Log.MktVal, na.rm = TRUE) / length(properties_SF.Trim$Log.MktVal)^(1/3)) +
+  coord_cartesian(xlim = c(6, 18)) +
+  labs(x = 'Natural Log of Property Values', y = 'Count', 
+       title = 'Figure 3: Log Transformed Distribution of Philadelphia Property Values',
+       subtitle = 'Single Family Homes Only',
+       caption = 'Source: Philadelphia Office of Property Assessment') +
+  theme_minimal()
+Log.Dist
+
+```
+
+As such, log-transformed market values was the response variable in the regression models. The primary multiple linear regression model contained 9 variables: Natural Log of Total Livable Area (square footage), Interior Condition, Exterior Condition, View Type, Distance to City Hall, Type 1 Crime, Type 2 Crime, Elementary School, and School Performance Score. The natural log of the total livable area was used to smooth an quasi-exponential relationship between market value and total livable area. Interior and exterior condition were rated on scales of 7 to 1, with 7 representing excellent condition and 1 representing severe blight, indicative of visible structural damage or open exposure to the elements. View type was a categorical variable that indicated the type of view that a property has, such as whether it has a skyline view or faces a park. The distance to city hall variable was added to account for proximity. It was calculated using the Haversine formula, which determines the great circle distance between two points on a sphere given their latitudes and longitudes. City Hall was chosen as a proxy for Center City due its central location in Philadelphia's spatial layout. The distance calculation does not account for street grids, which resulted in a systemic underestimate of the true distance. I believe this justifiable because the relative distance between properties was the matter of importance, not the absolute distance to the city center. Type 1 and Type 2 crimes were a weighted daily average of the count of crimes spanning from January 2014 to November 2019, the split made according to the FBI's Uniform Crime Reports criteria. The elementary schools were a categorical variable consisting of every public, catchment admit elementary school within Philadelphia. Private, charter, and special-admit schools were not included. This variable contains 160 levels and as such it forms a way to partition the city into 160 heterogeneous pieces. This, along with the crime variables, was intended to proxy the effect of an area on a property's market value. School score was the 'overall score' mentioned above, an aggregate of various performance ratings that the schools received. The incorporation of the school and crime data was done through the use of the point in polygon algorithm from the R GIS package 'sf'. Every observation in the properties dataset contained latitude and longitude coordinates, and through these I was able to run each property's location against the officially demarcated police district and elementary school geographies, which were obtained through the use of publicly available shape files - this also facilitated map-making for the purpose of analysis and presentation. In this way I was able to assign each property to its constituent police district and elementary school, after which merging was trivial. This collection of variables formed the regression equation like so: \[
+\widehat{market.value} = b_0 + b_1*ln(Total \ Livable Area) + b_2 * Exterior \ Condition \\
++ b_3 * Interior \ Condition + b_4 * View \ Type + b_5 * City \ Hall 
+\ Distance \\ + b_6 * Type \ 1 \ Crime + b_7 * Type \ 2 \ Crime + b_8 * Elementary \ School \\ 
++ b_9 * School \ Performance \ Score
+\]
+Where $b_0$ refers to the intercept of the regression model. The equation above is not an exact representation of the actual regression equation as elementary school and view type are categorical variables. As such, each of their constituent levels are represented as dummy variables, taking the value of 0 or 1 depending on whether or not they are present in a given observation. Since each of the 160 schools is essentially an independent variable with its own coefficient, including the full equation is not practical. R's 'Caret' package was used to construct the multiple regression model. 
+
+In addition to the multiple regression model, a random forest model was also used. I selected random forest for two principal reasons; first, the large quantity of data and relatively high number of weak to moderately strong predictors suggested that an ensemble learning method may be successful, and second, given the complexity of the task and relatively large number of independent variables, assumption violations in the multiple regression model seemed all but certain. As a non-parametric method that makes no assumptions about the data, random forest is a robust alternative to linear regression. This flexibility comes at the cost of interpretability and computational time. Several implementations of the random forest algorithm exist within R, I used the implementation found in the 'ranger' package for its speed relative to its peers. Note that the categorical variables were not included in the random forest model. To assess model overfitting and out of sample error, an 80/20 train-test split was done on the data - model specific results come from the 'train' data, and accuracy results come from the 'test' data. All residuals were calculated by exponentiating the logged predictions and subtracting them from the original market values. 
+
+### Results
+
+The summary output for the multiple regression model are below:
+
+```{r echo = FALSE, warning = FALSE, results = 'asis'}
+stargazer::stargazer(Linear.Model$finalModel, title = 'Figure 4: Linear Model Summary', keep = 0, header = FALSE, type = 'html')
+```
+
+The model coefficients can be found in Figure 5 in the appendix of this paper. From the results of the linear model, the model adjusted $R^2$ is 89.41%; which means that 89.4% of the variation in market values was explained by the independent variables included in the model. The F-Statistic shows that at least 1 of the 173 variables (including the factor levels) was statistically significant, and inspecting the individual variables shows that the majority of them attained significance as well. The random forest model has an $R^2$ of 95.82%, higher than the linear model. Ultimately, the more successful model is whichever one has the most prediction accuracy. As can be seen from the results below, the random forest model is significantly more accurate than the multiple regression model: 
+```{r echo = FALSE, warning = FALSE}
+Test.Accuracy <- data.frame(
+  RMSE = map_dbl(properties.Test[, c(16, 17)], ~ RMSE(., properties.Test$market_value)),
+  MAE = map_dbl(properties.Test[, c(16, 17)], ~ MAE(., properties.Test$market_value))
+) %>% 
+  map_dfc(~round(.)) %>% 
+  mutate(Model = c(
+    'Linear Model', 'Random Forest')) %>% 
+  select(3, 1:2)
+
+knitr::kable(Test.Accuracy, caption = 'Figure 6: Error Metrics For Regression Models')
+```
+
+The extent of this difference in accuracy is best visualized through geography. 
+
+```{r echo = FALSE, warning = FALSE, fig.width=9, fig.height=8}
+LM.resid <- properties.Test %>% 
+  group_by(ES_Short) %>% 
+  summarise(`Mean Residual` = mean(LM.Resid))
+# Merge
+ES.LM.Residuals <- ES.Catchment.Area %>% 
+  left_join(y = LM.resid, by = 'ES_Short')
+
+LM.Residuals.Plot <- ggplot(ES.LM.Residuals) +
+  geom_sf(aes(fill = `Mean Residual`)) +
+  ggthemes::theme_map() +
+  viridis::scale_fill_viridis(
+    name = 'Linear Model Residuals',
+    guide = guide_colorbar(
+      direction = 'horizontal',
+      barwidth = unit(85, units = 'mm'),
+      title.position = 'top',
+      title.hjust = 0.5
+    ),
+    option = 'magma', direction = -1) +
+  theme(legend.position = 'bottom') +
+  labs(title = 'Figure 7: Geographic Dispersion of Linear Model Prediction Errors',
+       subtitle = 'Average Residual by Elementary School Catchment')
+LM.Residuals.Plot
+
+```
+
+The linear model clearly shows more prediction error in areas with higher property values, indicative of heteroscedasticity. 
+
+```{r echo = FALSE, fig.height=8, fig.width=9}
+RF.Resid <- properties.Test %>% 
+  group_by(ES_Short) %>% 
+  summarise(`Mean Residual` = mean(RF.Resid))
+# Merge
+ES.RF.Residuals <- ES.Catchment.Area %>% 
+  left_join(y = RF.Resid, by = 'ES_Short')
+# Plot
+RF.Residuals.Plot <- ggplot(ES.RF.Residuals) +
+  geom_sf(aes(fill = `Mean Residual`)) +
+  ggthemes::theme_map() +
+  viridis::scale_fill_viridis(
+    name = 'Random Forest Residuals',
+    guide = guide_colorbar(
+      direction = 'horizontal',
+      barwidth = unit(85, units = 'mm'),
+      title.position = 'top',
+      title.hjust = 0.5
+    ),
+    option = 'cividis', direction = -1) +
+  theme(legend.position = 'bottom') +
+  labs(title = 'Figure 8: Geographic Dispersion of Random Forest Prediction Errors',
+       subtitle = 'Average Residual by Elementary School Catchment')
+RF.Residuals.Plot
+```
+
+A visual scan shows that the magnitude of prediction errors is far smaller in the random forest model. In general, prediction errors are still the highest in areas of high market values, but to a much lower extent. It is thus fair to conclude that the random forest model is superior for this use case. Both models provide a measure of variable importance but unfortunately, they are difficult to assess and compare against one another due to the independent variables not being homogeneous between them. A truncated linear model variable importance is shown in the appendix in Figure 9 - it shows that total livable area and the elementary schools are the most important variables, based on their standardized T-values. This differs from the random forest variable importance, where Type 2 crime and the distance to city hall were the two most important variables, as measured by impurity. The lack of a uniform scale between these measures compounds the difficulty of comparing and interpreting them. 
+
+
+### Limitations
+
+Assumption violations within the linear model present a significant limitation to interpreting variable importance. Similar to the residual map, the residual plot below shows clear heteroscedasticity, which leads to bias within standard errors and by extension, test statistics. 
+
+```{r echo = FALSE, warning = FALSE}
+Resid.Plot <- ggplot(data = properties.Test) +
+  geom_point(aes(x = Scaled.LM.Predictions, y = LM.Resid), alpha = 0.2) +
+  coord_cartesian(xlim = c(0, 1000000), ylim = c(-500000, 500000)) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = 'Fitted Market Values', y = 'Linear Model Residuals', title = 'Figure 11: Residuals vs Fitted Values') +
+  theme_minimal()
+Resid.Plot
+```
+
+
+Multicollinearity is also present within the linear model. As such, the linear model's variable importance measure must be treated with skepticism, along with some of the regression coefficients. Interior and exterior condition are the most affected with a Pearson correlation of 98.4%, and exterior condition's small coefficient and lack of statistical significance may be a direct consequence of this. The linear model's assessment of total livable area and the elementary schools having the largest importance seems reasonable, but errors in the test statistics make the metric used to reach that conclusion tenuous at best. This may potentially be exacerbated by the way the crime variables were added into the data. As mentioned in the 'method' section, the crime variables are a daily weighted average of crime data spanning from January 2014 to November 2019. In reality, crime statistics are rarely presented in absolute terms, rather they are presented as a per capita rate. Calculating per capita rates proved extremely difficult because all population data sources I found were at the census tract or zip code level, whereas the crime data is segmented by police district. In order to calculate a per capita rate, it is necessary to link these disparate geographies - to either find the population of each police district, or the count of crimes for each census tract. Ultimately, it simply was not practical to pursue this further given time constraints and other obligations. Had I more time, I would have attempted a GIS solution - computing the area of one polygon (census tract) that lies within another (police district) would have enabled me to make an estimate. Future analysis would be improved by performing this calculation. The magnitudes of the crime variables as they stand are misrepresented. In absolute terms, the type 1 and type 2 crime rates of Center City are comparable to those of the impoverished areas in North and West Philadelphia, but this ignores the differing population densities of these areas. Center City has a population density of some 93,000 people per square mile, orders of magnitude higher than the density in the high crime areas of North and West Philadelphia, which, not coincidentally, have densities lower than the rest of the city due to depopulation. I believe this inaccuracy greatly misrepresents the importance of the crime variables, adding another source of doubt to the overall variable importance calculations. Continuing on the theme of geography, another limitation comes from the lack of interaction between geographies in the linear model. The spatial effect of one elementary school catchment on another is not incorporated in the model. Empirically, it is easy to hypothesize that a given neighborhood that borders an impoverished area will have lower market values then an otherwise equivalent neighborhood that borders a wealthy area. Future analysis would again be improved by quantifying this effect. 
+
+As stated in the 'method' section, the random forest model did not include either of the two categorical variables. This is partly because the ranger implementation of random forest can only handle a certain number of levels within categorical variables. Since the elementary school variable has 160 levels, to include it requires converting the data into a sparse matrix. Unfortunately, technical constraints made this unfeasible. The run-time of the random forest model with school catchment and view type included spanned several hours. It would have most likely produced a richer, more accurate model, yet the computational cost was too high to justify. No hyper-parameter tuning was attempted for the same reason.  Had I more time, I would have included all variables in both models. This would enable easier comparison between the variable importance metrics between the two. 
+
+Finally, another important limitation is that of the data itself. As mentioned in the 'data' section of this paper, I uncovered numerous inconsistencies and errors within the data during the process of data cleaning. For all of these that I uncovered and accounted for, there are likely many more that I did not notice, potentially increasing the error with the models. Additionally, potentially useful variables like the number of bedrooms and bathrooms were discarded because of the high proportion of missing values that they contained. One potential way to mitigate this would be to use a technique such as KNN-imputation to estimate the values of the missing data points. Assigning every missing observation the rounded average of the number of bedrooms/bathrooms found in homes in the same tranche of market values would potentially provide a good, if flawed, estimate. A greater concern may be found within the market values themselves. The properties dataset contains the officially assessed market values of every home in the city, and property tax calculations are based off of these assessments. Unsurprisingly, there has been substantial criticism directed towards the methodology that the city used to arrive at these figures. If the response variable itself was flawed, then by extension the entire analysis was as well. An interesting exercise would be to compare these valuations to those found on a realty website such as Zillow and see the difference. The lack of insight into the data-generation process presents a potential limitation over all of the independent variables from the properties dataset - I have no knowledge on how these were recorded. If the methodology to record these values was incorrect, then so too would conclusions derived from their effects on market value. Ultimately, lack of insight into the true data-generation process is very common - this is often the constraint within which the real world operates.
+
+### Conclusion
+
+In this paper, I attempted to predict property values in Philadelphia and use the results to assess the factors that contribute to the vast discrepancy between market values in various parts of the city. While that goal itself has not been fully realized, I believe this analysis has provided a solid foundation which can be expanded and improved upon in pursuit of that goal. I have found that the non-parametric random forest has far superior performance for this purpose when compared to multiple linear regression, indicating that other non-parametric regression techniques such as gradient boosting may be better alternatives to test against the random forest. The linear model indicated that total livable area and the elementary school catchment were the most important variables, whereas in the random forest type 2 crime and the distance to city hall were the most important. Including all variables in the random forest would provide a more accurate basis of comparison between the models in regards to variable importance. Most of all, further analysis is needed to validate these results, especially in light of the assumption violations in the multiple regression model. I hope that the results of this analysis can inform and improve further analysis, which I hope that I myself will have the chance to undertake.  
+
+
+## References
+
+Philadelphia, Pa Metropolitan Division: Nonfarm Employment and Labor Force Data
+https://www.bls.gov/regions/mid-atlantic/data/xg-tables/ro3fx9524.htm
+
+Philadelphia - 2018 Safety and Justice Challenge Fact Sheet. (n.d.). Retrieved December 20, 2019, from http://www.safetyandjusticechallenge.org/wp-content/uploads/2018/10/Philadelphia-Safety-Justice-Challenge-Fact-Sheet.pdf.
+
+Philadelphia 2019 - The State of the City. (n.d.). Retrieved December 20, 2019, from https://www.pewtrusts.org/en/research-and-analysis/reports/2019/04/11/philadelphia-2019.
+
+## Appendix - Project Code
+#### Main Project Script 
+```{r Total.Project.Script, echo = TRUE, eval = FALSE}
+# Explore the Philadelphia Properties Dataset
+# Predict home values with regression techniques
+# Load packages
+library(data.table) # Fast data manipulation
+library(tidyverse) # plotting, functional programming, factor and date functions
+library(caret) # modeling 
+library(sf) # GIS tools
+# 1 - Data Cleaning --------------------------------------------------------------------------------
+# Load 
+# Properties contains the housing data, crime contains the crime data, school contains school catchment
+properties_SF.Trim <- fread('Econometrics Project\\opa_properties_23.10.19.csv')
+crime_dt <- fread('Econometrics Project\\arrest_data_daily_by_district_csv.csv')
+school_dt <- fread('Econometrics Project\\School.Data.Trimmed.csv')
+
+
+# Focusing on Properties first
+# Filter the data
+properties_SF.Trim <- properties_SF.Trim[category_code_description == 'Single Family']
+
+
+# Class of the variables
+variable_class <- properties_SF.Trim[, lapply(.SD, class)]
+variable_class <- variable_class %>% 
+  gather(key = 'Variable', value = 'Class')
+
+# Most columns are characters. Many categorical data columns are listed as integers, not factors
+# Many extraneous columns - will remove
+Delete_Cols <- variable_class$Variable[c(2, 3, 4, 10, 11, 12, 14, 15, 18, 19, 22, 
+                                         24, 25, 26, 29, 30, 31, 32, 33, 34, 
+                                         36, 41, 42, 44, 46, 47, 48, 49, 50, 51, 52,
+                                         53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 
+                                         66, 67, 68, 69)] 
+# Remove The Columns
+properties_SF.Trim <- properties_SF.Trim[, !..Delete_Cols]
+
+# Crimes Data
+# Classify crimes and aggregate by police district
+# Using FBI's UCR Standard 
+crime_dt[, Type1.Crimes := Homicide + Rape + `Robbery/Gun` + `Robbery/Other` + 
+           `Aggravated Assault/Gun` + `Aggravated Assault/Other` + `Burglary/Residential` +
+           `Burglary/Commercial` + `Theft of Motor Vehicle Tag` + `Theft from Person` +
+           `Theft from Auto` + `Retail Theft` + Theft + `Auto Theft`][, 
+            Type2.Crimes := `Drug Possession` + `Drug Sales` + DUI + `All Other Offenses`][, 
+            'date_formatted' := as.Date(date_value, 
+            format = '%m/%d/%Y')][, 'Year.Formatted' := lubridate::year(date_formatted)]
+
+# Load the PPD Shapefile
+# Will use this to assign properties to their Police District
+PPD.Districts <- read_sf('Econometrics Project\\PPD.Boundaries')
+PPD.Districts <- st_as_sf(PPD.Districts)
+PPD.Districts <- st_transform(PPD.Districts, crs = 4326)
+
+# Two districts have since been merged with others - accounting for that here
+crime_dt <- crime_dt[, dc_district := as_factor(dc_district)][, 
+           dc_district := fct_collapse(dc_district, `3` = '4', `22` = '23')][
+           !(dc_district %in% c(71))]
+
+# Aggregate and Summarise by Year and District
+crimeSummary <- crime_dt[, .(Total.Crimes = sum(Type1.Crimes, Type2.Crimes),
+                Total.Type1 = sum(Type1.Crimes), Total.Type2 = sum(Type2.Crimes)), 
+                by = .(Year.Formatted, dc_district)]
+
+# Compute Crime Rates
+crimeSummary.Melt <- crimeSummary %>% 
+  pivot_wider(names_from = Year.Formatted, values_from = c(Total.Crimes, Total.Type1, Total.Type2))
+crimeSummary.Melt <- setDT(crimeSummary.Melt)
+crimeDailyRates <- crimeSummary.Melt[, .(Police.District = dc_district, 
+                                         `2014Type1.Rate` = Total.Type1_2014 / 365, 
+                                         `2015Type1.Rate` = Total.Type1_2015 / 365,
+                                         `2016Type1.Rate` = Total.Type1_2016 / 366,
+                                         `2017Type1.Rate` = Total.Type1_2017 / 365,
+                                         `2018Type1.Rate` = Total.Type1_2018 / 365,
+                                         `2019Type1.Rate` = Total.Type1_2019 / 296,
+                                         `2014Type2.Rate` = Total.Type2_2014 / 365,
+                                         `2015Type2.Rate` = Total.Type2_2015 / 365,
+                                         `2016Type2.Rate` = Total.Type2_2016 / 366,
+                                         `2017Type2.Rate` = Total.Type2_2017 / 365,
+                                         `2018Type2.Rate` = Total.Type2_2018 / 365,
+                                         `2019Type2.Rate` = Total.Type2_2019 / 296)
+                                     ][, c('Type1.WeightedAvg', 'Type2.WeightedAvg') :=
+                                         .(0.05 * `2014Type1.Rate` + 0.1 * `2015Type1.Rate` +
+                                           0.15 * `2016Type1.Rate` + 0.2 * `2017Type1.Rate` + 
+                                           0.225 * `2018Type1.Rate` + 0.275 * `2019Type1.Rate`, 
+                                           0.05 * `2014Type2.Rate` + 0.1 * `2015Type2.Rate` +
+                                           0.15 * `2016Type2.Rate` + 0.2 * `2017Type2.Rate` + 
+                                           0.225 * `2018Type2.Rate` + 0.275 * `2019Type2.Rate`
+                                           )
+                                     ]
+
+# Reduce to just the variables going into the properties dataset
+crimeDailyRates <- crimeDailyRates[, .(Police.District, Type1.WeightedAvg, Type2.WeightedAvg)]
+
+# School Data
+ES.Catchment.Area <- read_sf('Econometrics Project\\Catchment_ES_2017-18')
+
+# ST_as_SF ensures that the Catchment is an SF object
+# Will enable merging later
+ES.Catchment.Area <- st_as_sf(ES.Catchment.Area, crs = 4326)
+ES.Catchment.Area <- st_transform(ES.Catchment.Area, crs = 4326)
+
+# Trim the School Performance Data
+# This includes more than just public schools, but all that's needed are the performance metrics
+school_dt <- school_dt[, c(3, 22)]
+
+
+# 2 - EDA ----------------------------------------------------------------------------------------
+# Distribution of Market Values is Strongly Skewed to the Right
+# Taking the log may normalize the data
+properties_SF.Trim[, Log.MktVal := log(market_value)]
+
+
+# Taking the log resulted in some -Inf's. Inspection revealed that these observations had market values of 0
+# Will remove them here
+Zero.MktVal <- properties_SF.Trim[Log.MktVal == -Inf]
+
+# There are 69 properties here with market values of 0
+# Will remove these
+properties_SF.Trim <- properties_SF.Trim[!is.infinite(properties_SF.Trim$Log.MktVal)]
+
+# Removing market value outliers - these were clearly mistakes
+properties_SF.Trim <- properties_SF.Trim[market_value < 100000000][
+  !is.na(market_value)
+]
+
+# Number of rooms 
+# Almost none of these align with the number of bathrooms + number of bedrooms
+# Unclear how a 'room' is defined here
+properties_SF.Trim[, number_of_rooms := NULL]
+
+# Now depth
+# Will remove this variable 
+properties_SF.Trim[, depth := NULL]
+
+# Garage Spaces
+# This variable misrepresents garage spaces for condo's
+# Will list a condo as having 30 spaces, as though it were a 30 car garage
+properties_SF.Trim[, garage_spaces := NULL]
+properties_SF.Trim[, garage_type := NULL]
+
+# Number of Bathrooms and Bedrooms
+# Both have 100K observations with 0 bedrooms or bathrooms
+properties_SF.Trim <- properties_SF.Trim[!(location %in% c('900 S 12TH ST', '812 S 13TH ST'))]
+properties_SF.Trim[, c('number_of_bathrooms', 'number_of_bedrooms') := NULL]
+
+# Number of Stories
+# 100K observations with 0 stories
+properties_SF.Trim[, number_stories := NULL]
+
+# Basements
+# 1/3rd missing values, will remove
+properties_SF.Trim[, basements := NULL]
+
+# Total Area
+# Some properties that have a listed area of zero
+# Isolating on those reveals that many observations have total area of zero but non zero total livable area
+# Will remove total area
+properties_SF.Trim[, total_area := NULL]
+
+# Total Livable Area
+# 526 observations that show as having an area of zero
+# Will remove these
+# Some properties with very high total livable areas are not single family homes
+# Many are housing for religious societies (Convents)
+# Others are clearly mistakes
+properties_SF.Trim <- properties_SF.Trim[total_livable_area > 0]
+properties_SF.Trim <- properties_SF.Trim[
+  !owner_1 %in% c('REV DENNIS J DOUGHERTY', 'DOUGHERTY DENNIS J', 'PHILADELPHIA UNIVERSITY', 
+                  'DENNIS J DOUGHERTY	', 'TALMUDICAL YESHIVA OF PHI', "SAINT JOSEPH'S UNIVERSITY",
+                  'SAINT JOSEPHS UNIVERSITY', 'CHURCH CHRISTIAN COMPASSI', 'CHRIST EMPOWERMENT TEMPLE',
+                  'ST JAMES CATHOLIC', 'CARMELITE CONVENT OF', '	1439-61 NORTH 31ST STREET', 
+                  'UNITY MISSION CHURCH', 'KWAN UM SA BUDDHIST', 'SECOND BAPTIST CHURCH',
+                  'UNITED COMMUNITIES', 'SOMERSET LLC', 'INTERCOMMUNITY ACTION INC', 
+                  'REV DENNIS DOUGHERTY', 'INDONESIA BETHEL CHURCH B', 'DARE TO IMAGINE CHURCH IN',
+                  'FRIENDS BEHAVORIAL HEALTH', 'CHOICE ACADEMICS INC', 'FRIENDS REHABILITATION PR',
+                  'ARCHBISHOP OF PHILADELPHI', 'HOLMESBURG BAPTIST CHURCH', 'DOMINICAN FATHERS & BROTH',
+                  'TALMUDICAL YESHIVA OF PHI', 'JAMESON EVANGELISTIC', '1439-61 NORTH 31ST STREET')]
+                  
+
+# Removing Philadelphia Housing Authority, Redevelopment Authority, and Land Bank houses
+properties_SF.Trim <- properties_SF.Trim[!(owner_1 %in% 
+                                       c('PHILADELPHIA HOUSING AUTH', 'PHILA HOUSING AUTHORITY', 
+                                       'PHILADELPHIA LAND BANK', 'PHILADELPHIA HOUSING', 
+                                       'PHILADELPHIA REDEVELOPMEN', 'PHILA REDEVELOPMENT AUTH',
+                                       'PHILA HOUSING AUTH', 'PHILA REDEVELOPMENT'))]
+
+# Removing Condo Parking Spaces and Residential Air Rights
+properties_SF.Trim <- properties_SF.Trim[
+  !(building_code_description) %in% c('CONDO PARKING SPACE', 'AIR RIGHTS RESIDENTIAL')]
+
+# Removing NA's and 0's in Exterior and Interior Condition
+properties_SF.Trim <- properties_SF.Trim[
+  !is.na(exterior_condition)][
+  !is.na(interior_condition)][!(interior_condition %in% 0)][
+  !(exterior_condition %in% 0)]
+
+# Removing Observations with Year Built of '0'
+properties_SF.Trim <- properties_SF.Trim[!(year_built) %in% c('0')]
+
+# Removing Observations with Missing Lat/Long
+properties_SF.Trim <- properties_SF.Trim[!is.na(lng)]
+
+# Most of the remaining non ID variables will go in the model
+
+# 3 - Transformation ----------------------------------------------------------------------------
+# Recode Categorical Vars as factors/numeric where applicable
+# Exterior Condition
+properties_SF.Trim[, exterior_condition := as_factor(exterior_condition)]
+properties_SF.Trim[, exterior_condition := fct_recode(exterior_condition, 
+                                     '7' = '1', '6' = '2', '5' = '3',
+                                     '4' = '4', '3' = '5', 
+                                     '2' = '6', '1' = '7')]
+properties_SF.Trim[,
+    exterior_condition := as.numeric(as.character(properties_SF.Trim$exterior_condition))]
+
+# Interior Condition
+properties_SF.Trim[, interior_condition := as_factor(interior_condition)][
+  , interior_condition := fct_recode(interior_condition,
+                                     '7' = '1', '6' = '2', '5' = '3',
+                                     '4' = '4', '3' = '5', 
+                                     '2' = '6', '1' = '7')]
+properties_SF.Trim[,
+    interior_condition := as.numeric(as.character(properties_SF.Trim$interior_condition))]
+
+# View Type
+properties_SF.Trim[, c('view_type') := 
+                     lapply(.SD, as_factor), .SDcols = c('view_type')]
+
+# Add the distance variable - Using City Hall as a proxy for 'downtown' distance
+Properties.Long.Lat <- properties_SF.Trim[, .(objectid, lng, lat)]
+# Compute Distance - Using the Haversine Method
+properties_SF.Trim[, 
+  City.Hall.Distance := geosphere::distHaversine(Properties.Long.Lat[, c(2:3)], 
+                                                 c(-75.1635112, 39.952335), r = 3963.1905919)]
+
+# To add in Police District and School Catchment, I will create an SF object with the Long.Lat DT above
+Properties.Long.Lat <- st_as_sf(Properties.Long.Lat, coords = c('lng', 'lat'), crs = 4326)
+
+# Apply Point in Polygon Algorithm to See which Police District each address belongs to
+PD.Intersection <- st_intersection(Properties.Long.Lat, PPD.Districts)
+st_geometry(PD.Intersection) <- NULL
+PD.Intersection <- PD.Intersection[, c(1, 5)]
+
+# Merge
+properties_SF.Trim <- merge(properties_SF.Trim, PD.Intersection, by = 'objectid')
+ 
+# Rename and set as factor
+setnames(properties_SF.Trim, old = 'DISTRICT_', new = 'Police.District')
+properties_SF.Trim[, Police.District := as_factor(Police.District)]
+
+# Add in the Crime Data
+properties_SF.Trim <- merge(properties_SF.Trim, crimeDailyRates, by = 'Police.District')
+
+# Repeating For Elementary Schools
+ES.Intersection <- st_intersection(Properties.Long.Lat, ES.Catchment.Area)
+st_geometry(ES.Intersection) <- NULL
+ES.Intersection <- ES.Intersection[, c(1, 2, 4)]
+
+# Merge with Intersection DT
+properties_SF.Trim <- merge(properties_SF.Trim, ES.Intersection, by = 'objectid')
+
+# Merge with Performance Data
+# Repeating the ULCS code to make merging easier
+colnames(school_dt) <- c('ES_ID', 'School.Score')
+school_dt[, ES_ID := as.character(school_dt$ES_ID)]
+properties_SF.Trim <- merge(properties_SF.Trim, school_dt, by = 'ES_ID')
+properties_SF.Trim[, School.Score := as.numeric(properties_SF.Trim$School.Score)]
+
+
+# 4 - Model -------------------------------------------------------------------------------
+# Running Descriptive Stats
+# Measures of Centrality
+MktVal.Centrality.Final <- data.table(
+  Mean = mean(properties_SF.Trim$market_value, na.rm = TRUE),
+  `Trimmed Mean 5%` = mean(properties_SF.Trim$market_value, na.rm = TRUE, trim = 0.05),
+  `Trimmed Mean 10%` = mean(properties_SF.Trim$market_value, na.rm = TRUE, trim = 0.1),
+  Median = median(properties_SF.Trim$market_value, na.rm = TRUE)
+)
+Log.MktVal.Centrality.Final <- data.table(
+  Mean = mean(properties_SF.Trim$Log.MktVal, na.rm = TRUE),
+  `Trimmed Mean 5%` = mean(properties_SF.Trim$Log.MktVal, na.rm = TRUE, trim = 0.05),
+  `Trimmed Mean 10%` = mean(properties_SF.Trim$Log.MktVal, na.rm = TRUE, trim = 0.1),
+  Median = median(properties_SF.Trim$Log.MktVal, na.rm = TRUE)
+)
+# Exponentiate back the log tranformed centrality measures
+Exp.Centrality.Final <- map_df(Log.MktVal.Centrality.Final, exp)
+
+# Combine Results
+Centrality.DT.Final <- bind_rows(
+  MktVal.Centrality.Final,
+  Log.MktVal.Centrality.Final,
+  Exp.Centrality.Final
+) %>% 
+  map_df(~round(., 2)) %>% 
+  mutate(Distribution = c('Market Values', 'Log Transformed Market Values', 'Exponentiated Log Values')) %>% 
+  select(5, 1:4)
+
+# Measures of variability
+MktVal.Variability.Final <- data.table(
+  `Standard Deviation` = sd(properties_SF.Trim$market_value, na.rm = TRUE),
+  `Median Absolute Deviation` = mad(properties_SF.Trim$market_value, na.rm = TRUE),
+  `Interquartile Range` = IQR(properties_SF.Trim$market_value, na.rm = TRUE),
+  Range = range(properties_SF.Trim$market_value, na.rm = TRUE)[2] - range(properties_SF.Trim$market_value, na.rm = TRUE)[1]
+) %>% map_df(~round(., 2))
+
+# Split Data into Test and Train
+properties.Model <- properties_SF.Trim[
+  , .(objectid, exterior_condition, interior_condition, total_livable_area, year_built, view_type,
+      Log.MktVal, City.Hall.Distance, Type1.WeightedAvg, Type2.WeightedAvg, ES_Short, School.Score)][
+  , total_livable_area := log(total_livable_area)
+      ]
+
+in.train <- createDataPartition(properties.Model$year_built, p = 0.8, list = FALSE, times = 1)
+
+properties.Train <- properties.Model[in.train]
+properties.Test <- properties.Model[-in.train]
+
+# Extracting the original market values and object ID's to merge back and calculate residuals
+Market.Value.DT <- properties_SF.Trim[, .(objectid, market_value)]
+
+# Test correlations
+Numeric.Correlation <- data.frame(Correlation = sapply(select_if(properties.Model, is.numeric), 
+       cor, y = properties.Model$Log.MktVal, use = 'complete.obs'))
+
+# Linear Model
+set.seed(11202019)
+LM.Params <- trainControl(method = "boot", number = 25)
+Linear.Model <- train(
+  x = properties.Train[, c(2, 3, 4, 6, 8, 9, 10, 11, 12)],
+  y = properties.Train$Log.MktVal,
+  method = 'lm',
+  trControl = LM.Params
+)
+
+# Add in Residuals
+properties.Train <- properties.Train %>% 
+  modelr::add_predictions(Linear.Model, var = 'Log.LM.Predictions') %>% 
+  left_join(y = Market.Value.DT, by = 'objectid') %>% 
+  mutate(Scaled.LM.Predictions = exp(Log.LM.Predictions),
+         LM.Residuals = market_value - Scaled.LM.Predictions)
+
+
+# Random Forest
+RF.Model <- ranger::ranger(Log.MktVal ~ total_livable_area + exterior_condition + interior_condition +
+                           City.Hall.Distance + Type1.WeightedAvg + Type2.WeightedAvg + School.Score,
+                           data = properties.Train,
+                           num.trees = 500, mtry = 4)
+
+
+# Add predictions and residuals
+setDT(properties.Train)
+properties.Train[, c('Log.RF.Predictions') := 
+                   RF.Model$predictions,][,
+  c('Scaled.RF.Predictions') := 
+      .(exp(Log.RF.Predictions))][,
+  RF.Residuals := market_value - Scaled.RF.Predictions
+  ]
+
+
+# Consolidate Training Results
+Training.Preds <- data.table(
+  objectid = properties.Train$objectid,
+  Scaled.LM.Predictions = properties.Train$Scaled.LM.Predictions,
+  Sclaed.RF.Predictions = properties.Train$Scaled.RF.Predictions
+)
+
+
+Training.Preds <- merge(Training.Preds, Market.Value.DT, by = 'objectid')
+
+Training.Accuracy <- data.frame(
+  RMSE = map_dbl(Training.Preds[, c(2:3)], ~ RMSE(., Training.Preds$market_value)),
+  MAE = map_dbl(Training.Preds[, c(2:3)], ~ MAE(., Training.Preds$market_value))
+) %>% 
+  map_dfc(~round(.)) %>% 
+  mutate(
+    Model = c('Linear Model', 'Random Forest')
+  ) %>% 
+  select(3, 1, 2)
+
+
+# Consolidate and calculate residuals for Test Accuracy
+# Add in Market Value Test DT
+# Test Predictions
+properties.Test <- merge(properties.Test, Market.Value.DT, by = 'objectid')
+properties.Test[,
+ ':=' ('Log.LM.Predictions' = predict(Linear.Model, properties.Test), 
+      'Log.RF.Predictions' = predict(RF.Model, data = properties.Test)$predictions)][, 
+      c('Scaled.LM.Predictions', 'Scaled.RF.Predictions') 
+      := lapply(.SD, exp), 
+      .SDcols = c('Log.LM.Predictions', 'Log.RF.Predictions')][, 
+      c('LM.Resid', 'RF.Resid') := market_value - .SD, 
+    .SDcols = c('Scaled.LM.Predictions', 'Scaled.RF.Predictions')]
+
+
+# Calculate Accuracy
+Test.Accuracy <- data.frame(
+  RMSE = map_dbl(properties.Test[, c(16, 17)], ~ RMSE(., properties.Test$market_value)),
+  MAE = map_dbl(properties.Test[, c(16, 17)], ~ MAE(., properties.Test$market_value))
+) %>% 
+  map_dfc(~round(.)) %>% 
+  mutate(Model = c(
+    'Linear Model', 'Random Forest')) %>% 
+  select(3, 1:2)
+
+
+# End Time
+end.time <- Sys.time()
+# Time Elapsed
+time.taken <- end.time - start.time
+```
+
+#### Figure 1: Market Value Map
+```{r Fig1.MktValMap, echo = TRUE, eval = FALSE}
+properties.ES.Avg <- properties_SF.Trim[, .(Mean = mean(market_value)), by = ES_ID]
+# Merge
+ES.Catchment.Area.Plot <- ES.Catchment.Area %>% 
+  left_join(y = properties.ES.Avg, by = 'ES_ID')
+# Plot
+ES.MktVal <- ggplot(ES.Catchment.Area.Plot) +
+  geom_sf(aes(fill = Mean)) +
+  coord_sf(expand = TRUE) +
+  ggthemes::theme_map() +
+  viridis::scale_fill_viridis(name = 'Mean Market Value', 
+                              guide = guide_colorbar(
+                                direction = 'horizontal',
+                                barwidth = unit(85, units = 'mm'),
+                                title.position = 'top',
+                                title.hjust = 0.5
+                              ), labels = scales::comma, option = 'magma', direction = 1) +
+  theme(legend.position = 'bottom') +
+  labs(title = 'Property Values in Philadelphia',
+       subtitle = 'Average Market Value by Elementary School Catchment Area, 2019',
+       caption = 'Source: Philadelphia Office of Property Assesments')
+ES.MktVal
+```
+
+#### Figure 2: Distribution of Market Values
+
+```{r Fig2.MktValueDist, echo = TRUE, eval = FALSE}
+Mkt.Val.Dist <- ggplot(properties_SF.Trim) +
+  geom_histogram(aes(market_value), binwidth = 2 * IQR(properties_SF.Trim$market_value, na.rm = TRUE) / length(properties_SF.Trim$market_value)^(1/3)) +
+  coord_cartesian(xlim = c(0, 1000000)) +
+  scale_x_continuous(breaks = seq(0, 1000000, by = 100000), labels = scales::comma) +
+  labs(x = 'Property Value', y = 'Count', title = 'Figure 2: Distribution of Home Values in Philadelphia', subtitle = 'Single Family Homes Only',
+       caption = 'Source: Philadelphia Office of Property Assessment') +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 50, hjust = 1))
+Mkt.Val.Dist
+```
+
+#### Figure 3: Log-Transformed Distribution of Market Values
+```{r Fig3.Log.MktValDist, echo = TRUE, eval = FALSE}
+Log.Dist <- ggplot(properties_SF.Trim) +
+  geom_histogram(aes(Log.MktVal), binwidth = 2 * IQR(properties_SF.Trim$Log.MktVal, na.rm = TRUE) / length(properties_SF.Trim$Log.MktVal)^(1/3)) +
+  coord_cartesian(xlim = c(6, 18)) +
+  labs(x = 'Natural Log of Property Values', y = 'Count', 
+       title = 'Figure 3: Log Transformed Distribution of Philadelphia Property Values',
+       subtitle = 'Single Family Homes Only',
+       caption = 'Source: Philadelphia Office of Property Assessment') +
+  theme_minimal()
+Log.Dist
+```
+
+
+#### Figure 4: Linear Model Summary
+```{r Fig4.LMSummary, echo = TRUE, eval = FALSE}
+stargazer::stargazer(Linear.Model$finalModel, title = 'Figure 4: Linear Model Summary', keep = 0)
+```
+
+
+#### Figure 5: Linear Model Variable Results
+```{r Fig5.LMVarResults, echo = TRUE}
+knitr::kable(broom::tidy(Linear.Model$finalModel), caption = 'Linear Model Results')
+
+
+```
+
+
+#### Figure 6: Accuracy Table
+
+```{r Fig6.AccTable, echo = TRUE, eval = FALSE}
+Test.Accuracy <- data.frame(
+  RMSE = map_dbl(properties.Test[, c(16, 17)], ~ RMSE(., properties.Test$market_value)),
+  MAE = map_dbl(properties.Test[, c(16, 17)], ~ MAE(., properties.Test$market_value))
+) %>% 
+  map_dfc(~round(.)) %>% 
+  mutate(Model = c(
+    'Linear Model', 'Random Forest')) %>% 
+  select(3, 1:2)
+
+knitr::kable(Test.Accuracy, caption = 'Figure 6: Error Metrics For Regression Models')
+```
+
+#### Figure 7: Linear Model Residuals Map
+
+```{r Fig.7LM_Map, echo = TRUE, eval = FALSE}
+LM.resid <- properties.Test %>% 
+  group_by(ES_Short) %>% 
+  summarise(`Mean Residual` = mean(LM.Resid))
+# Merge
+ES.LM.Residuals <- ES.Catchment.Area %>% 
+  left_join(y = LM.resid, by = 'ES_Short')
+
+LM.Residuals.Plot <- ggplot(ES.LM.Residuals) +
+  geom_sf(aes(fill = `Mean Residual`)) +
+  ggthemes::theme_map() +
+  viridis::scale_fill_viridis(
+    name = 'Linear Model Residuals',
+    guide = guide_colorbar(
+      direction = 'horizontal',
+      barwidth = unit(85, units = 'mm'),
+      title.position = 'top',
+      title.hjust = 0.5
+    ),
+    option = 'magma', direction = -1) +
+  theme(legend.position = 'bottom') +
+  labs(title = 'Figure 7: Geographic Dispersion of Linear Model Prediction Errors',
+       subtitle = 'Average Residual by Elementary School Catchment')
+LM.Residuals.Plot
+```
+
+#### Figure 8: Random Forest Residuals Map
+
+```{r Fig8.RFMap, echo = TRUE, eval = FALSE}
+RF.Resid <- properties.Test %>% 
+  group_by(ES_Short) %>% 
+  summarise(`Mean Residual` = mean(RF.Resid))
+# Merge
+ES.RF.Residuals <- ES.Catchment.Area %>% 
+  left_join(y = RF.Resid, by = 'ES_Short')
+# Plot
+RF.Residuals.Plot <- ggplot(ES.RF.Residuals) +
+  geom_sf(aes(fill = `Mean Residual`)) +
+  ggthemes::theme_map() +
+  viridis::scale_fill_viridis(
+    name = 'Random Forest Residuals',
+    guide = guide_colorbar(
+      direction = 'horizontal',
+      barwidth = unit(85, units = 'mm'),
+      title.position = 'top',
+      title.hjust = 0.5
+    ),
+    option = 'cividis', direction = -1) +
+  theme(legend.position = 'bottom') +
+  labs(title = 'Figure 8: Geographic Dispersion of Random Forest Prediction Errors',
+       subtitle = 'Average Residual by Elementary School Catchment')
+RF.Residuals.Plot
+```
+
+#### Figure 9: Linear Model Variable Importance
+
+```{r Fig9.LM.Importance, echo = TRUE}
+plot(varImp(Linear.Model), top = 20)
+
+```
+
+#### Figure 10: Random Forest Variable Importance
+
+```{r Fig10.rfImportance, echo = TRUE}
+RF.Importance <- as.data.frame(ranger::importance(RF.Model))
+RF.Importance <- setDT(RF.Importance, keep.rownames = TRUE)
+colnames(RF.Importance) <- c('Variable', 'Importance Score')
+knitr::kable(RF.Importance, caption = 'Figure 10: Random Forest Importance Scores')
+```
+
+#### Figure 11: Linear Model Residual vs Fitted Plot
+
+```{r Fig11.LMResidPlot, echo = TRUE, eval = FALSE}
+Resid.Plot <- ggplot(data = properties.Test) +
+  geom_point(aes(x = Scaled.LM.Predictions, y = LM.Resid), alpha = 0.2) +
+  coord_cartesian(xlim = c(0, 1000000), ylim = c(-500000, 500000)) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = 'Fitted Market Values', y = 'Linear Model Residuals', title = 'Figure 11: Residuals vs Fitted Values') +
+  theme_minimal()
+Resid.Plot
+```
+
